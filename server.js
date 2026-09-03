@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-campusbite-secret';
 if (!DATABASE_URL) console.warn('DATABASE_URL is not set. The server cannot use PostgreSQL until it is configured.');
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000, keepAlive: true }) : null;
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false, max: 6, idleTimeoutMillis: 30000, connectionTimeoutMillis: 8000, statement_timeout: 15000, query_timeout: 18000, keepAlive: true }) : null;
 if(pool){
   pool.on('error',(err)=>{ console.error('PostgreSQL pool error:',err); });
 }
@@ -189,8 +189,9 @@ app.get('/api/customer/state',auth,role('customer'),async(req,res)=>{
 });
 
 app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
-  const client=await (await db()).connect();
+  let client;
   try{
+    client=await (await db()).connect();
     const {items,slot,shop}=req.body;
     const allowedPickupSlots=new Set([
       'ASAP',
@@ -252,11 +253,12 @@ app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
     }
     await client.query('COMMIT');
     res.json({order:serializeOrder(row),wallet:balance});
-  }catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Could not place order'});}finally{client.release();}
+  }catch(e){try{if(client)await client.query('ROLLBACK');}catch{}console.error(e);res.status(500).json({error:'Could not place order'});}finally{if(client)client.release();}
 });
 
 app.patch('/api/customer/orders/:id/reschedule',auth,role('customer'),async(req,res)=>{
-  const client=await (await db()).connect();
+  let client;
+  try{client=await (await db()).connect();}catch(e){console.error(e);return res.status(503).json({error:'CampusBite database is temporarily unavailable. Please retry.'});}
   const allowedRescheduleSlots=[
     '9:00 AM','9:30 AM','10:00 AM','10:30 AM','11:00 AM','11:30 AM',
     '12:00 PM','12:30 PM','1:00 PM','1:30 PM','2:00 PM','2:30 PM','3:00 PM'

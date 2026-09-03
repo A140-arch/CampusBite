@@ -1246,24 +1246,33 @@ window.addEventListener("load",()=>{
   const API="";
   let pollTimer=null;
   let syncing=false;
+  let menuSyncing=false;
+  let staffSyncing=false;
+  let lastWasteRefresh=0;
   function token(){return localStorage.getItem(TOKEN_KEY)||""}
   function user(){try{return JSON.parse(localStorage.getItem("campusBiteRoleSession")||"null")}catch(e){return null}}
   async function api(path,opts={}){
     const headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});
     if(token()) headers.Authorization="Bearer "+token();
+    const method=String(opts.method||"GET").toUpperCase();
+    // Only safe/idempotent reads are automatically retried. Never retry an order
+    // POST: a gateway timeout can happen after PostgreSQL commits, and retrying
+    // that POST could create a duplicate order/payment.
+    const retryable=method==='GET'||method==='HEAD'||opts.retryOnGateway===true;
+    const attempts=retryable?3:1;
     let lastError=null;
-    for(let attempt=0;attempt<3;attempt++){
+    for(let attempt=0;attempt<attempts;attempt++){
       try{
         const r=await fetch(API+path,Object.assign({},opts,{headers}));
         let data={}; try{data=await r.json()}catch(e){}
         if(r.ok)return data;
         lastError=new Error(data.error||("Request failed ("+r.status+")"));
-        if(![502,503,504].includes(r.status)||attempt===2)throw lastError;
+        if(!retryable||![502,503,504].includes(r.status)||attempt===attempts-1)throw lastError;
       }catch(e){
         lastError=e;
-        if(attempt===2)throw e;
+        if(!retryable||attempt===attempts-1)throw e;
       }
-      await new Promise(resolve=>setTimeout(resolve,800*(attempt+1)));
+      await new Promise(resolve=>setTimeout(resolve,700*(attempt+1)));
     }
     throw lastError||new Error("Request failed");
   }
@@ -1301,8 +1310,11 @@ window.addEventListener("load",()=>{
     finally{syncing=false;}
   }
   async function loadMenu(){
+    if(menuSyncing)return;
+    menuSyncing=true;
     try{const data=await api('/api/menu');const byId=new Map((data.items||[]).map(x=>[Number(x.id),x]));MENU.forEach(m=>{const x=byId.get(Number(m.id));if(x){m.available=!!x.available;if(x.price!=null)m.price=Number(x.price);if(x.stock!=null)m.stock=Number(x.stock);}});if(typeof renderHome==='function')renderHome();if(typeof renderMenu==='function')renderMenu();}
     catch(e){}
+    finally{menuSyncing=false;}
   }
   function indiaToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())}
   async function customerLogin(){
@@ -1332,7 +1344,8 @@ window.addEventListener("load",()=>{
     catch(e){toast(e.message||'Auto-pay update failed');}
   }
   async function loadStaff(silent=false){
-    if(!token()||user()?.role!=="staff")return;
+    if(!token()||user()?.role!=="staff"||staffSyncing)return;
+    staffSyncing=true;
     try{
       // Keep the staff console usable even if one secondary dashboard endpoint
       // is temporarily unavailable on Render. Menu availability must remain
@@ -1370,7 +1383,8 @@ window.addEventListener("load",()=>{
           }
         });
       }catch(e){}
-      if(typeof renderWasteIntelligence==='function')renderWasteIntelligence(shop);
+      const now=Date.now();
+      if(typeof renderWasteIntelligence==='function' && (now-lastWasteRefresh>60000)){lastWasteRefresh=now;renderWasteIntelligence(shop);}
       const shopMenu=MENU.filter(x=>x.shop===shop);$('menuControl').innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}">${x.available?'Available ✓':'Not available'}</button></div>`).join('');
       document.querySelectorAll('[data-server-menu]').forEach(b=>b.onclick=async()=>{
         const item=MENU.find(x=>x.id===Number(b.dataset.serverMenu));
@@ -1378,21 +1392,49 @@ window.addEventListener("load",()=>{
         const next=!item.available;
         b.disabled=true;
         try{
-          const d=await api('/api/staff/menu/'+item.id,{method:'PATCH',body:JSON.stringify({available:next})});
+          const d=await api('/api/staff/menu/'+item.id,{method:'PATCH',body:JSON.stringify({available:next}),retryOnGateway:true});
           item.available=!!d.item.available;
-          // Update the control immediately. A later dashboard refresh must not
-          // be allowed to turn a successful availability change into a 502 toast.
+          // PostgreSQL has confirmed the change. Update the visible control
+          // immediately; no page refresh and no full dashboard reload.
+          b.textContent=item.available?'Available ✓':'Not available';
+          b.classList.toggle('is-available',item.available);
+          b.classList.toggle('is-unavailable',!item.available);
+          b.disabled=false;
+          renderHome();
           renderMenu();
-          await loadStaff(true);
+          // Quietly synchronize the rest of the app without making this action
+          // depend on another dashboard endpoint.
+          loadMenu();
           toast(item.name+' is now '+(item.available?'available':'not available'));
         }catch(e){
+          // Never leave the UI showing an unconfirmed availability state.
+          // Silently re-sync the authoritative server value; no scary error toast.
+          await loadMenu();
+          const fresh=MENU.find(x=>x.id===item.id);
+          if(fresh){
+            b.textContent=fresh.available?'Available ✓':'Not available';
+            b.classList.toggle('is-available',fresh.available);
+            b.classList.toggle('is-unavailable',!fresh.available);
+          }
           b.disabled=false;
-          toast(e.message||'Availability update failed');
         }
       });
     }catch(e){if(!silent)toast(e.message||'Could not sync staff console');}
+    finally{staffSyncing=false;}
   }
-  function startPolling(){clearInterval(pollTimer);loadCanteenStatus();pollTimer=setInterval(()=>{const u=user();loadCanteenStatus();if(!u)return;if(u.role==='customer'){loadCustomerState(true);loadMenu();}if(u.role==='staff')loadStaff();},3000);}
+  function startPolling(){
+    clearInterval(pollTimer);
+    loadCanteenStatus();
+    pollTimer=setInterval(()=>{
+      const u=user();
+      if(!u)return;
+      // Silent, lightweight synchronization only. User actions themselves never
+      // wait for this timer, and no manual refresh control is exposed.
+      loadCanteenStatus();
+      if(u.role==='customer'){loadCustomerState(true);loadMenu();}
+      if(u.role==='staff'){loadStaff(true);}
+    },20000);
+  }
   function wire(){
     const sl=$('continueCustomer'),sf=$('continueStaff');if(sl)sl.onclick=customerLogin;if(sf)sf.onclick=staffLogin;
     const cf=$('confirm');if(cf)cf.onclick=placeOrder;const cm=$('confirmMoney');if(cm)cm.onclick=topup;
