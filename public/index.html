@@ -873,7 +873,7 @@ function renderWasteIntelligence(shop){
       </div>`).join('');
   }).catch(()=>{
     $('simpleWasteShop').textContent='Preparation recommendations temporarily unavailable';
-    box.innerHTML='<div class="simpleWasteItem"><div><b>Forecast unavailable</b><div class="simpleWasteNumbers">Please refresh the staff dashboard.</div></div></div>';
+    box.innerHTML='<div class="simpleWasteItem"><div><b>Forecast unavailable</b><div class="simpleWasteNumbers">The forecast will update automatically when the service is available.</div></div></div>';
   });
 }
 
@@ -1025,7 +1025,7 @@ window.addEventListener("load",()=>{
   window.addEventListener("load",updateIdentity);
   document.addEventListener("click",()=>setTimeout(updateIdentity,30));
   window.addEventListener("storage",updateIdentity);
-  setInterval(updateIdentity,500);
+  
 
   window.campusBiteRefreshIdentity=updateIdentity;
 })();
@@ -1046,7 +1046,7 @@ window.addEventListener("load",()=>{
     }
   }
   window.addEventListener("load",()=>setTimeout(updateHeaderAvatar,100));
-  setInterval(updateHeaderAvatar,500);
+  
 })();
 </script>
 
@@ -1069,7 +1069,7 @@ window.addEventListener("load",()=>{
     if(explicit) explicit.textContent=wanted;
   }
   window.addEventListener("load",()=>setTimeout(update,100));
-  setInterval(update,400);
+  
 })();
 </script>
 
@@ -1155,7 +1155,7 @@ window.addEventListener("load",()=>{
     }
   }
   window.addEventListener("load",()=>setTimeout(sync,80));
-  setInterval(sync,300);
+  
 })();
 </script>
 
@@ -1246,35 +1246,15 @@ window.addEventListener("load",()=>{
   const API="";
   let pollTimer=null;
   let syncing=false;
-  let menuSyncing=false;
-  let staffSyncing=false;
-  let lastWasteRefresh=0;
   function token(){return localStorage.getItem(TOKEN_KEY)||""}
   function user(){try{return JSON.parse(localStorage.getItem("campusBiteRoleSession")||"null")}catch(e){return null}}
   async function api(path,opts={}){
     const headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});
     if(token()) headers.Authorization="Bearer "+token();
-    const method=String(opts.method||"GET").toUpperCase();
-    // Only safe/idempotent reads are automatically retried. Never retry an order
-    // POST: a gateway timeout can happen after PostgreSQL commits, and retrying
-    // that POST could create a duplicate order/payment.
-    const retryable=method==='GET'||method==='HEAD'||opts.retryOnGateway===true;
-    const attempts=retryable?3:1;
-    let lastError=null;
-    for(let attempt=0;attempt<attempts;attempt++){
-      try{
-        const r=await fetch(API+path,Object.assign({},opts,{headers}));
-        let data={}; try{data=await r.json()}catch(e){}
-        if(r.ok)return data;
-        lastError=new Error(data.error||("Request failed ("+r.status+")"));
-        if(!retryable||![502,503,504].includes(r.status)||attempt===attempts-1)throw lastError;
-      }catch(e){
-        lastError=e;
-        if(!retryable||attempt===attempts-1)throw e;
-      }
-      await new Promise(resolve=>setTimeout(resolve,700*(attempt+1)));
-    }
-    throw lastError||new Error("Request failed");
+    const r=await fetch(API+path,Object.assign({},opts,{headers}));
+    let data={}; try{data=await r.json()}catch(e){}
+    if(!r.ok) throw new Error(data.error||("Request failed ("+r.status+")"));
+    return data;
   }
   function setSession(session){
     localStorage.setItem("campusBiteRoleSession",JSON.stringify(session));
@@ -1300,21 +1280,12 @@ window.addEventListener("load",()=>{
     if(!token()||user()?.role!=="customer"||syncing)return;
     syncing=true;
     try{const st=await api('/api/customer/state');hydrateState(st);}
-    catch(e){
-      if(!silent){
-        const msg=String(e?.message||'');
-        if(/502|503|504|starting|unavailable/i.test(msg)) toast('CampusBite is still connecting. Please wait a moment.');
-        else toast(msg||"Could not load account data");
-      }
-    }
+    catch(e){if(!silent)toast(e.message||"Could not load account data");}
     finally{syncing=false;}
   }
   async function loadMenu(){
-    if(menuSyncing)return;
-    menuSyncing=true;
     try{const data=await api('/api/menu');const byId=new Map((data.items||[]).map(x=>[Number(x.id),x]));MENU.forEach(m=>{const x=byId.get(Number(m.id));if(x){m.available=!!x.available;if(x.price!=null)m.price=Number(x.price);if(x.stock!=null)m.stock=Number(x.stock);}});if(typeof renderHome==='function')renderHome();if(typeof renderMenu==='function')renderMenu();}
     catch(e){}
-    finally{menuSyncing=false;}
   }
   function indiaToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())}
   async function customerLogin(){
@@ -1325,7 +1296,7 @@ window.addEventListener("load",()=>{
   }
   async function staffLogin(){
     const name=$('staffName').value.trim(),shop=$('staffShop').value,pin=$('staffPin').value.trim(),err=$('staffError');
-    try{const d=await api('/api/auth/staff',{method:'POST',body:JSON.stringify({name,shop,pin})});localStorage.setItem(TOKEN_KEY,d.token);setSession(d.user);view('staff');await loadStaff();startPolling();toast(d.user.shop+' staff console ready');}
+    try{const d=await api('/api/auth/staff',{method:'POST',body:JSON.stringify({name,shop,pin})});localStorage.setItem(TOKEN_KEY,d.token);setSession(d.user);view('staff');await loadStaff();if(typeof renderWasteIntelligence==='function')renderWasteIntelligence(d.user.shop);startPolling();toast(d.user.shop+' staff console ready');}
     catch(e){if(err){err.textContent=e.message||'Invalid staff PIN.';err.style.display='block';}else toast(e.message||'Staff login failed');}
   }
   async function placeOrder(){
@@ -1343,21 +1314,10 @@ window.addEventListener("load",()=>{
     try{const d=await api('/api/customer/autopay',{method:'POST',body:JSON.stringify(next)});window.campusBiteAutoPay=d.autopay||next;if(d.wallet!=null)wallet=Number(d.wallet);await loadCustomerState(true);toast(d.autopay?.enabled?'Auto-pay enabled':'Auto-pay disabled');}
     catch(e){toast(e.message||'Auto-pay update failed');}
   }
-  async function loadStaff(silent=false){
-    if(!token()||user()?.role!=="staff"||staffSyncing)return;
-    staffSyncing=true;
+  async function loadStaff(){
+    if(!token()||user()?.role!=="staff")return;
     try{
-      // Keep the staff console usable even if one secondary dashboard endpoint
-      // is temporarily unavailable on Render. Menu availability must remain
-      // independent of orders/summary/ratings.
-      const results=await Promise.allSettled([
-        api('/api/staff/orders'),
-        api('/api/staff/summary?date='+encodeURIComponent(indiaToday())),
-        api('/api/staff/ratings')
-      ]);
-      const od=results[0].status==='fulfilled'?results[0].value:{orders:[]};
-      const sm=results[1].status==='fulfilled'?results[1].value:{orders:0,revenue:0};
-      const rd=results[2].status==='fulfilled'?results[2].value:{average:0,count:0,ratings:[]};
+      const [od,sm,rd]=await Promise.all([api('/api/staff/orders'),api('/api/staff/summary?date='+encodeURIComponent(indiaToday())),api('/api/staff/ratings')]);
       const shop=user().shop; const all=(od.orders||[]).map(mapOrder); orders=all;
       const pickupMinutes=o=>{const slot=String(o.slot||'ASAP').trim(); if(!slot||slot.toUpperCase()==='ASAP') return -1; const m=slot.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i); if(!m) return 24*60+999; let h=Number(m[1]),min=Number(m[2]); const ap=m[3].toUpperCase(); if(ap==='AM'&&h===12)h=0; if(ap==='PM'&&h!==12)h+=12; return h*60+min};
       all.sort((a,b)=>{const pa=pickupMinutes(a),pb=pickupMinutes(b); if(pa!==pb)return pa-pb; return Number(a.createdAt||0)-Number(b.createdAt||0);});
@@ -1383,64 +1343,31 @@ window.addEventListener("load",()=>{
           }
         });
       }catch(e){}
-      const now=Date.now();
-      if(typeof renderWasteIntelligence==='function' && (now-lastWasteRefresh>60000)){lastWasteRefresh=now;renderWasteIntelligence(shop);}
       const shopMenu=MENU.filter(x=>x.shop===shop);$('menuControl').innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}">${x.available?'Available ✓':'Not available'}</button></div>`).join('');
-      document.querySelectorAll('[data-server-menu]').forEach(b=>b.onclick=async()=>{
-        const item=MENU.find(x=>x.id===Number(b.dataset.serverMenu));
-        if(!item||b.disabled)return;
-        const next=!item.available;
-        b.disabled=true;
-        try{
-          const d=await api('/api/staff/menu/'+item.id,{method:'PATCH',body:JSON.stringify({available:next}),retryOnGateway:true});
-          item.available=!!d.item.available;
-          // PostgreSQL has confirmed the change. Update the visible control
-          // immediately; no page refresh and no full dashboard reload.
-          b.textContent=item.available?'Available ✓':'Not available';
-          b.classList.toggle('is-available',item.available);
-          b.classList.toggle('is-unavailable',!item.available);
-          b.disabled=false;
-          renderHome();
-          renderMenu();
-          // Quietly synchronize the rest of the app without making this action
-          // depend on another dashboard endpoint.
-          loadMenu();
-          toast(item.name+' is now '+(item.available?'available':'not available'));
-        }catch(e){
-          // Never leave the UI showing an unconfirmed availability state.
-          // Silently re-sync the authoritative server value; no scary error toast.
-          await loadMenu();
-          const fresh=MENU.find(x=>x.id===item.id);
-          if(fresh){
-            b.textContent=fresh.available?'Available ✓':'Not available';
-            b.classList.toggle('is-available',fresh.available);
-            b.classList.toggle('is-unavailable',!fresh.available);
-          }
-          b.disabled=false;
-        }
-      });
-    }catch(e){if(!silent)toast(e.message||'Could not sync staff console');}
-    finally{staffSyncing=false;}
+      document.querySelectorAll('[data-server-menu]').forEach(b=>b.onclick=async()=>{const item=MENU.find(x=>x.id===Number(b.dataset.serverMenu));if(!item)return;try{const d=await api('/api/staff/menu/'+item.id,{method:'PATCH',body:JSON.stringify({available:!item.available})});item.available=!!d.item.available;renderMenu();await loadStaff();toast(item.name+' is now '+(item.available?'available':'not available'));}catch(e){toast(e.message||'Availability update failed');}});
+    }catch(e){toast(e.message||'Could not sync staff console');}
   }
+  let pollBusy=false;
   function startPolling(){
     clearInterval(pollTimer);
-    loadCanteenStatus();
-    pollTimer=setInterval(()=>{
-      const u=user();
-      if(!u)return;
-      // Silent, lightweight synchronization only. User actions themselves never
-      // wait for this timer, and no manual refresh control is exposed.
-      loadCanteenStatus();
-      if(u.role==='customer'){loadCustomerState(true);loadMenu();}
-      if(u.role==='staff'){loadStaff(true);}
-    },20000);
+    const tick=async()=>{
+      if(pollBusy)return;
+      const u=user(); if(!u||!token())return;
+      pollBusy=true;
+      try{
+        if(u.role==='customer'){ await Promise.allSettled([loadCustomerState(true),loadMenu(),loadCanteenStatus()]); }
+        else if(u.role==='staff'){ await loadStaff(); }
+      }finally{pollBusy=false;}
+    };
+    tick();
+    pollTimer=setInterval(tick,20000);
   }
   function wire(){
     const sl=$('continueCustomer'),sf=$('continueStaff');if(sl)sl.onclick=customerLogin;if(sf)sf.onclick=staffLogin;
     const cf=$('confirm');if(cf)cf.onclick=placeOrder;const cm=$('confirmMoney');if(cm)cm.onclick=topup;
     const ap=$('autoPayBtn');if(ap)ap.onclick=saveAutopay;
     const lg=$('logoutBtn');if(lg)lg.onclick=clearSession;
-    const saved=user();if(saved&&token()){if(saved.role==='customer'){loadCustomerState();loadMenu();view('home');}else if(saved.role==='staff'){view('staff');loadStaff();}startPolling();}else if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
+    const saved=user();if(saved&&token()){if(saved.role==='customer'){loadCustomerState();loadMenu();view('home');}else if(saved.role==='staff'){view('staff');loadStaff();if(typeof renderWasteIntelligence==='function')renderWasteIntelligence(saved.shop||user().shop);}startPolling();}else if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
   }
   window.campusBiteApi={api,loadCustomerState,loadStaff,loadMenu};
   window.campusBiteLogout=clearSession;

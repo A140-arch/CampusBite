@@ -13,14 +13,13 @@ const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-campusbite-secret';
 if (!DATABASE_URL) console.warn('DATABASE_URL is not set. The server cannot use PostgreSQL until it is configured.');
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false, max: 6, idleTimeoutMillis: 30000, connectionTimeoutMillis: 8000, statement_timeout: 15000, query_timeout: 18000, keepAlive: true }) : null;
-if(pool){
-  pool.on('error',(err)=>{ console.error('PostgreSQL pool error:',err); });
-}
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false, max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 8000 }) : null;
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/api', (req,res,next)=>{ res.set('Cache-Control','no-store'); next(); });
+app.use('/api', (err,req,res,next)=>{ console.error('API error:',err); if(res.headersSent)return next(err); res.status(500).json({error:'Request could not be completed'}); });
 
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 const shops = ['Hari Sandwich','Reo Store','Campus Café'];
@@ -169,29 +168,19 @@ app.post('/api/auth/staff',async(req,res)=>{
 });
 
 app.get('/api/customer/state',auth,role('customer'),async(req,res)=>{
-  try{
-    const d=await db();
-    const s=(await d.query('SELECT * FROM customers WHERE id=$1',[req.user.id])).rows[0];
-    if(!s)return res.status(404).json({error:'Customer not found'});
-    let os=[];
-    try{
-      os=(await d.query(`SELECT o.*, r.rating, r.created_at AS rating_created_at
-        FROM orders o LEFT JOIN order_ratings r ON r.order_id=o.id
-        WHERE o.customer_id=$1 ORDER BY o.created_at DESC`,[s.id])).rows;
-    }catch(e){ console.error('Customer orders load skipped:',e.message); }
-    let tx=[];
-    try{
-      tx=(await d.query('SELECT * FROM wallet_transactions WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 100',[s.id])).rows;
-    }catch(e){ console.error('Wallet history load skipped:',e.message); }
+  try{const d=await db(); const s=(await d.query('SELECT * FROM customers WHERE id=$1',[req.user.id])).rows[0]; if(!s)return res.status(404).json({error:'Customer not found'});
+    const os=(await d.query(`SELECT o.*, r.rating, r.created_at AS rating_created_at
+      FROM orders o LEFT JOIN order_ratings r ON r.order_id=o.id
+      WHERE o.customer_id=$1 ORDER BY o.created_at DESC`,[s.id])).rows;
+    const tx=(await d.query('SELECT * FROM wallet_transactions WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 100',[s.id])).rows;
     const firstOrderEligible=os.length===0;
-    res.json({wallet:Number(s.wallet_balance||0),cashback:Number(s.cashback||75),autopay:{enabled:!!s.autopay_enabled,threshold:Number(s.autopay_threshold||200),amount:Number(s.autopay_amount||500)},orders:os.map(serializeOrder),transactions:tx.map(serializeTx),firstOrderEligible});
-  }catch(e){console.error('Customer state failed:',e);res.status(503).json({error:'CampusBite is temporarily connecting to the database. Please retry.'});}
+    res.json({wallet:Number(s.wallet_balance),cashback:Number(s.cashback),autopay:{enabled:s.autopay_enabled,threshold:Number(s.autopay_threshold),amount:Number(s.autopay_amount)},orders:os.map(serializeOrder),transactions:tx.map(serializeTx),firstOrderEligible});
+  }catch(e){console.error(e);res.status(500).json({error:'State unavailable'});}
 });
 
 app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
-  let client;
+  const client=await (await db()).connect();
   try{
-    client=await (await db()).connect();
     const {items,slot,shop}=req.body;
     const allowedPickupSlots=new Set([
       'ASAP',
@@ -253,12 +242,11 @@ app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
     }
     await client.query('COMMIT');
     res.json({order:serializeOrder(row),wallet:balance});
-  }catch(e){try{if(client)await client.query('ROLLBACK');}catch{}console.error(e);res.status(500).json({error:'Could not place order'});}finally{if(client)client.release();}
+  }catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Could not place order'});}finally{client.release();}
 });
 
 app.patch('/api/customer/orders/:id/reschedule',auth,role('customer'),async(req,res)=>{
-  let client;
-  try{client=await (await db()).connect();}catch(e){console.error(e);return res.status(503).json({error:'CampusBite database is temporarily unavailable. Please retry.'});}
+  const client=await (await db()).connect();
   const allowedRescheduleSlots=[
     '9:00 AM','9:30 AM','10:00 AM','10:30 AM','11:00 AM','11:30 AM',
     '12:00 PM','12:30 PM','1:00 PM','1:30 PM','2:00 PM','2:30 PM','3:00 PM'
@@ -323,19 +311,22 @@ app.get('/api/canteen/status',async(req,res)=>{
     const d=await db();
     const out={};
     for(const shop of shops){
-      try{
-        const avgRow=(await d.query(`SELECT AVG(EXTRACT(EPOCH FROM (ready_at-prep_started_at))/60.0) AS avg_prep FROM orders WHERE shop=$1 AND prep_started_at IS NOT NULL AND ready_at IS NOT NULL AND ready_at >= NOW()-INTERVAL '30 days'`,[shop])).rows[0];
-        const avgPrep=Math.max(3,Math.min(30,Number(avgRow?.avg_prep)||5));
-        const rows=(await d.query(`SELECT status,created_at,prep_started_at FROM orders WHERE shop=$1 AND status < 3 ORDER BY created_at ASC`,[shop])).rows;
-        let wait=0;
-        for(const o of rows){
-          if(Number(o.status)===1 && o.prep_started_at){const elapsed=Math.max(0,(Date.now()-new Date(o.prep_started_at).getTime())/60000);wait+=Math.max(0.5,avgPrep-elapsed);}else wait+=avgPrep;
+      const avgRow=(await d.query(`SELECT AVG(EXTRACT(EPOCH FROM (ready_at-prep_started_at))/60.0) AS avg_prep FROM orders WHERE shop=$1 AND prep_started_at IS NOT NULL AND ready_at IS NOT NULL AND ready_at >= NOW()-INTERVAL '30 days'`,[shop])).rows[0];
+      const avgPrep=Math.max(3,Math.min(30,Number(avgRow?.avg_prep)||5));
+      const rows=(await d.query(`SELECT status,created_at,prep_started_at FROM orders WHERE shop=$1 AND status < 3 ORDER BY created_at ASC`,[shop])).rows;
+      let wait=0;
+      for(const o of rows){
+        if(Number(o.status)===1 && o.prep_started_at){
+          const elapsed=Math.max(0,(Date.now()-new Date(o.prep_started_at).getTime())/60000);
+          wait+=Math.max(0.5,avgPrep-elapsed);
+        }else{
+          wait+=avgPrep;
         }
-        out[shop]={activeOrders:rows.length,averagePrepMinutes:Math.round(avgPrep*10)/10,waitMinutes:rows.length?Math.max(1,Math.ceil(wait)):0};
-      }catch(e){ out[shop]={activeOrders:0,averagePrepMinutes:5,waitMinutes:0,unavailable:true}; console.error('Canteen shop status skipped:',shop,e.message); }
+      }
+      out[shop]={activeOrders:rows.length,averagePrepMinutes:Math.round(avgPrep*10)/10,waitMinutes:rows.length?Math.max(1,Math.ceil(wait)):0};
     }
     res.json({shops:out,updatedAt:new Date().toISOString()});
-  }catch(e){console.error('Canteen status failed:',e);res.status(503).json({error:'Canteen status temporarily unavailable'});}
+  }catch(e){console.error(e);res.status(500).json({error:'Canteen status unavailable'});}
 });
 
 
@@ -433,24 +424,21 @@ app.patch('/api/staff/menu/:id',auth,role('staff'),async(req,res)=>{
   try{
     const d=await db();
     const id=Number(req.params.id);
-    const shop=String(req.user.shop||'').trim();
     if(!Number.isInteger(id)) return res.status(400).json({error:'Invalid menu item'});
-    if(!shops.includes(shop)) return res.status(403).json({error:'Invalid staff shop'});
+    if(!shops.includes(String(req.user.shop||''))) return res.status(403).json({error:'Invalid staff shop'});
     if(typeof req.body?.available!=='boolean') return res.status(400).json({error:'Availability must be true or false'});
-    // This endpoint is intentionally self-contained: changing availability must
-    // not depend on orders, ratings, forecasting, or any other staff dashboard query.
     const out=(await d.query(
       `UPDATE menu_items
        SET available=$1
        WHERE id=$2 AND shop=$3
        RETURNING id,shop,name,available`,
-      [req.body.available,id,shop]
+      [req.body.available,id,req.user.shop]
     )).rows[0];
-    if(!out) return res.status(404).json({error:'Menu item not found for this shop'});
+    if(!out) return res.status(403).json({error:'You cannot change another shop\'s menu'});
     res.json({item:out});
   }catch(e){
     console.error('Availability update failed:',e);
-    res.status(500).json({error:'Availability update failed. Please try again.'});
+    res.status(500).json({error:'Availability update failed'});
   }
 });
 
@@ -458,13 +446,6 @@ app.get('/api/staff/orders',auth,role('staff'),async(req,res)=>{try{const d=awai
 app.get('/api/staff/ratings',auth,role('staff'),async(req,res)=>{try{const d=await db();const summary=(await d.query(`SELECT COUNT(*)::int AS count, COALESCE(ROUND(AVG(rating)::numeric,1),0) AS average FROM order_ratings WHERE shop=$1`,[req.user.shop])).rows[0];const rows=(await d.query(`SELECT r.rating,r.created_at,o.public_id,c.name AS customer_name FROM order_ratings r JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=r.customer_id WHERE r.shop=$1 ORDER BY r.created_at DESC LIMIT 12`,[req.user.shop])).rows;res.json({average:Number(summary.average||0),count:Number(summary.count||0),ratings:rows.map(r=>({rating:Number(r.rating),createdAt:new Date(r.created_at).getTime(),orderId:r.public_id,customerName:r.customer_name||'Student'}))});}catch(e){console.error(e);res.status(500).json({error:'Ratings unavailable'});}});
 app.patch('/api/staff/orders/:id/status',auth,role('staff'),async(req,res)=>{try{const d=await db();const row=(await d.query('SELECT * FROM orders WHERE public_id=$1 AND shop=$2',[req.params.id,req.user.shop])).rows[0];if(!row)return res.status(404).json({error:'Order not found'});if(Number(row.status)>=3)return res.status(400).json({error:'Order is already completed'});const next=Number(row.status)+1;if(next!==Number(req.body.status))return res.status(400).json({error:'Invalid next status'});let sql='UPDATE orders SET status=$1';const vals=[next,row.id];if(next===1)sql+=', prep_started_at=COALESCE(prep_started_at,NOW())';if(next===2)sql+=', ready_at=COALESCE(ready_at,NOW())';if(next===3)sql+=', completed_at=COALESCE(completed_at,NOW())';sql+=' WHERE id=$2 RETURNING *';const out=(await d.query(sql,vals)).rows[0];res.json({order:serializeOrder(out)});}catch(e){console.error(e);res.status(500).json({error:'Status update failed'});}});
 app.get('/api/staff/summary',auth,role('staff'),async(req,res)=>{try{const d=await db();const day=req.query.date||new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());const rows=(await d.query(`SELECT * FROM orders WHERE shop=$1 AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = $2::date`,[req.user.shop,day])).rows;const revenue=rows.reduce((a,r)=>a+Number(r.total),0);const active=rows.filter(r=>r.status<3).length;res.json({date:day,orders:rows.length,revenue,active});}catch(e){console.error(e);res.status(500).json({error:'Summary unavailable'});}});
-
-app.use((err,req,res,next)=>{
-  console.error('Unhandled API error:',err);
-  if(res.headersSent)return next(err);
-  if(req.path.startsWith('/api/')) return res.status(500).json({error:'CampusBite service temporarily unavailable. Please retry.'});
-  res.status(500).send('CampusBite service temporarily unavailable.');
-});
 
 app.get('/{*splat}',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
 
